@@ -1,0 +1,586 @@
+================================================================================
+REVERSE ENGINEERING — sdb.img (TASCAM DP-008EX, 31.2 GB)
+Partición FAT32 + partición oculta propietaria "MTR" (con audio)
+================================================================================
+
+Fecha del análisis: análisis forense/ingeniería inversa de la imagen sdb.img.
+
+Resumen ejecutivo
+--------------------------------------------------------------------------------
+sdb.img es la imagen de una tarjeta SD formateada por un TASCAM DP-008EX
+(8-pista, etiqueta la partición FAT como "DP-008EX", OEM FAT32 = "TAVFS2.0").
+El disco real (SDHC 32 GB / ~31.2 GB) contiene DOS o MÁS particiones físicas,
+pero el MBR (tabla de particiones DOS) SOLO declara una única partición FAT32:
+
+  - Partición 1  (declarada en MBR):  FAT32,  sectores 63 .. 8389001
+    (~4.3 GB), tipos FAT32 (0x0C). Básicamente vacía (BACKUP/, WAVE/, UTILITY/).
+  - Partición "MTR" (oculta, NO declarada en el MBR):  sectores 8389002 .. 61079551
+    (~26.98 GB / 26977561600 bytes), usa el espacio restante de la tarjeta.
+    Es la que almacena los SONGs y el audio multicanal (TRACK 1-8 + MASTER).
+
+El fabricante (TASCAM) la denomina "MTR partition". El usuario no puede acceder a
+ella desde un PC; solo la FAT es visible. Este documento describe su formato
+interno, derivado del análisis de los bytes de la imagen.
+
+Este firmware DP008E22 no aportó cadenas legibles (el binario está cifrado/comprimido);
+todo lo que sigue se dedujo directamente de la imagen de disco.
+
+--------------------------------------------------------------------------------
+1. LAYOUT FÍSICO DEL DISCO (MBR)
+--------------------------------------------------------------------------------
+MBR en sector 0:
+  - Signature 0x55AA presente.
+  - 1 sola entrada de partición:
+      boot=0x00  type=0x0B (FAT32, modo CHS/LBA)  LBA start=63  sectors=8385867
+  - El resto del MBR (particiones 2-4) está a cero.
+
+Por tanto, el disco se reparte como:
+  [ MBR + FAT32 (~4.3 GB) ][ región oculta MTR (~26.98 GB) ]
+
+Tamaños (bytes):
+  imagen total        = 31,272,730,624  (61079552 sectores)
+  FIN de FAT32        = sector (63+8385867) * 512 = 8,385,930 * 512
+                      = 4,293,596,160   <-- INICIO REAL de la partición MTR
+  región oculta (MTR) = 26,979,134,464 bytes (empezando en 4,293,596,160)
+
+NOTA IMPORTANTE SOBRE LOS OFFSETS: este informe fue elaborado inicialmente con
+un base de la partición MTR desplazado 0x180000 bytes (1.5 MiB). Los offsets
+absolutos/símbolos de la §3/§8 están expresados respecto a 4,295,169,024
+(que es +0x180000 del inicio real). Los valores relativos e interpretaciones
+siguen siendo válidos; el base REAL (lo que usa el driver FUSE) es
+4,293,596,160, y con él:
+      superbloque    rel 0x210000 = abs 0x1000... (4,293,596,160 + 0x210000)
+      tabla de canciones rel 0x228030
+      directorio MTR     rel 0x240000  (espejo en rel 0x390000)
+      primer bloque de audio (prueba)  rel 0x1055DC00
+
+
+Todas las direcciones de "región oculta" que aparecen abajo son RELATIVAS al
+inicio de dicha región (offset absoluto = 4,295,169,024 + offset_relativo).
+Algunas se dan en absoluto con el prefijo 0x1000-.. (0x100000000 = 4 GiB).
+
+--------------------------------------------------------------------------------
+2. SISTEMA DE ARCHIVOS FAT32 (declarado / visible)
+--------------------------------------------------------------------------------
+  Byte/sector     512
+  Sectores/cluster 64   (cluster = 32 KiB)
+  Reserved        32
+  #FATs            2
+  FAT size      1024 sectores c/u
+  Root cluster     2
+  OEM              "TAVFS2.0"
+  Volumen          "HDR2488" (campo label del boot sector); el nombre largo del
+                   volumen en la carpeta raíz es "DP-008EX".
+
+Contenido de la raíz FAT32:
+  - "DP-008EX"  (etiqueta de volumen, attr 0x08)
+  - BACKUP/   (dir, cluster 65538)
+  - WAVE/     (dir, cluster 65539)
+  - UTILITY/  (dir, cluster 65540)
+  Las tres carpetas están vacías en esta imagen (solo "." y "..").
+
+Nota: el boot sector FAT32 tiene el OEM "TAVFS2.0" — un OEM personalizado de
+TASCAM (TA = TASCAM, VFS = virtual file system / 2.0). El nombre de volumen largo
+"DP-008EX" aparece tanto en la raíz como en la tabla de directorios MTR (ver §4).
+
+--------------------------------------------------------------------------------
+3. REGIÓN OCULTA MTR — PÁGINA/SUPERBLOQUE DE INICIO
+--------------------------------------------------------------------------------
+Offsets relativos al inicio de la región MTR:
+
+  [0x00000]  ~0x058000  0xFF (borrado / espacio libre). 588,736 bytes.
+  [0x90000]  SUPERBLOQUE DE PARTICION  (versión/MTR):
+      01 01 00 00 00 00 00 02 00 00 28 00 00 00 00 00 ...
+      00 00 00 00 14 0a 00 00 00 00 07 08 00 00 00 00 ...
+      32 bytes de cabecera: "01 01 00 00 00 00 00 02 00 00 28 00 ..."
+      (marcador de formato MTR v1, struct de 20-32 bytes; se repite idéntico
+       en todas las unidades de 2 GiB, patrón de búsqueda
+       "0101000000000002000028", que solo aparece 1 vez -> 1 única partición MTR
+       lógica aunque físicamente se reparte en varias unidades).
+  [0xa8000]  TABLA DE CANCIONES (SONG TABLE):
+      Tabla de 250 slots, cada slot = 36 bytes.
+      Los primeros bytes de cada slot:
+        53 4F 4E 47 30 30 30 00 00 00 00 00 00 00 00 <n>  ("SONG001"..)
+      Y campo corto ASCII 8 bytes, ej. "S000","S001", ... "S250".
+      bytes 8..23 (4 dwords big-endian) son campos de estado (0 = vacía).
+      Slots con datos: SONG001 (idx 0) y SONG002 (idx 1). El resto vacíos.
+  [0xC0000]  DIRECTORIO de bloques del sistema de archivos MTR.
+  [0x210000] Copia espejo (backup) del directorio [0xC0000].
+
+El resto de la partición MTR está organizado en UNIDADES de ~2 GiB (ver §5).
+Hay además directorios de canción "08EX" a aproximadamente
+  0x2005E2A00 (~8.2 GiB), 0x400B1D400 (~16.4 GiB) y 0x601057E00 (~24.6 GiB),
+que son los puntos de partida de las tres "MTR sub-particiones" activas
+(partición logical 1/2/3: byte 0x01/0x02/0x03 en el header de bloque).
+
+--------------------------------------------------------------------------------
+4. DIRECTORIO MTR (formato estilo FAT)
+--------------------------------------------------------------------------------
+Dos directorios idénticos (espejo) en [0xC0000] y [0x210000]. Su estructura es
+una tabla de bloques:
+
+  offset 0x00  : "00 00 00 00 20 20 20 20 ..." (volumen / ".." === dAdA ...)
+  offset 0x38  : entrada "S000" : "00 00 00 40 80 00 00 00 00 36 09 aa 00 00 00 80
+                00 00 00 02 00 80 07 8a 53 30 30 30"
+                 <- campo 16-bit LE = 0x400 (tamaño de bloque 1024),
+                    campo 24-bit LE = 0x02 (cluster inicial),
+                    flags ...
+  offset 0x40  : comienzo de la TABLA DE ENTRADAS, elementos de 0x40 bytes (64B).
+
+Entradas relevantes del directorio (cada entrada 0x40 bytes):
+
+  Blk[1]  : 00 00 00 40 80 00 00 00 ... -> "S000" (raíz de la canción)
+  Blk[4]  : "MTR_FILE"  -> nombre de archivo 8 bytes
+  Blk[8]  : "MIS_FILE"
+  Blk[11] : "CONT"      -> contiene la estructura de las tracks
+  Blk[6]  : "TNOC"      (= CONTon = CONT negativo), con bytes de estado/checksum
+  Blk[13],[15] : tabla de índices de bloques de pistas:
+             en Blk[13]: 00 00 00 1b 00 01 80 / 00 00 00 1c 00 03 00 / ...  → pares
+             (número de track / número de bloque), lista de 8-11 sub-bloques.
+  Blk[16]-[183]: tabla de BLOQUES LIBRES asignados, entradas de 0x40 bytes
+             patrón: 00 00 XX 00 00 ... 00 00 XX 40  (dirección = XX*0x40).
+
+Acceso a pistas: los directorios MTR del bloque "08EX" (ver §3) en las tres
+sub-particiones contienen el índice de pistas "Track  1" ... "Track 256".
+
+Los nombres de archivo internos del sistema MTR son:
+  - "MTR_FILE"   (archivo de canción / la canción en sí)
+  - "MIS_FILE"   (misceláneo / ajustes de la canción)
+  - "CONT"       (controladores / estructura de pistas)
+  - "TNOC"       ("CONT" invertido, cabecera de validación)
+Estos nombres FIJOS confirman que es un FS propietario (no FAT ni MBR).
+
+--------------------------------------------------------------------------------
+5. UNIDADES DE DATOS DE ~2 GiB Y ESTRUCTURA DE UNA CANCIÓN
+--------------------------------------------------------------------------------
+Cada sub-particion MTR está fragmentada en unidades (chunks) de exactamente
+2 GiB = 0x80000000 = 2,147,483,648 bytes. Cada unidad contiene la misma
+reestructuración de bloques:
+
+  [ 0x000000 .. 0x09xxxx ]  bloques del sistema / superbloque (repetido en cada
+                            unidad)
+  [ 0x103C0000 (aprox.)  ]  zona de DATOS de audio (bloques "D")
+  [ <ésta+30 MB>         ]  zona "00" (vaciado/free), 30,998,528 bytes
+                            (~29.6 MiB) — aparenta ser colchón/free del FS.
+  El resto: 0xFF (no asignado).
+
+Dentro de cada zona "D" de datos se encuentran bloques de pista. El marcador
+"00 10 52 58" (= 0x105258, en little/big endian) aparece en los headers de
+bloque de pista (posiblemente = tamaño de bloque de audio, 1,065,048 bytes?).
+
+Ejemplos verificados de bloques de audio (16-bit PCM, ver §6):
+  - 0x103DE400 ...  (bloque corto de 792 bytes, 100% muestras duplicadas)
+  - 0x103E4C00 ...  (bloque de 40,960 bytes, 100% muestras duplicadas)
+  - 0x903C6C00 ... WAV de la canción demo (parsing RIFF OK)
+
+--------------------------------------------------------------------------------
+6. FORMATO DE AUDIO DE LAS PISTAS (los "tracks" MTR)
+--------------------------------------------------------------------------------
+Los datos de audio de las pistas se almacenan como PCM lineal de 16 bits por
+muestra, arquitectura little-endian, 44,100 Hz (CD-quality, como especifica el
+fabricante), estéreo 2 canales (o mono con duplicación).
+
+Propiedad observada y verificada en los bloques "D" de audio:
+Cada muestra de 16-bit LE aparece DOS veces consecutivas (duplicada):
+    ej.  17 F8 17 F8 72 F6 72 F6 C6 F0 C6 F0 ...
+Esto corresponde a las herramientas usadas por TASCAM (el motor de audio opera
+a doble precisión / repite cada muestra). En los bloques sin duplicación el 100%
+de los pares (offset 0/2) coinciden, es decir la pista es en realidad MONO de
+16-bit; el hardware la trata como un stream L==R ("smpl" chunk del WAV demo
+también está presente, el WAV oficial es estéreo con L!=R para la master).
+
+De-dup para reproducción: se toma cada par (2 bytes) como 1 muestra de 16-bit LE.
+  - 0x103DE400: 792 bytes -> 396 bytes -> 198 muestras 16-bit (0.0045 s)
+  - 0x103E4C00: 40,960 bytes -> 20,480 bytes -> 10,240 muestras (0.23 s)
+Indices de pista (señal) : la señal está en el rango [-0.5, +0.5] RMS bajo,
+típico de audio de baja ganancia, sin saturación (máx amplitud ~0.23).
+
+Los bloques de pista están separados por 0x00 o 0xFF (padding) a múltiplos de
+128-4096 bytes, lo que sugiere páginas de 0x400 (1024) o 0x1000 (4096) bytes.
+
+--------------------------------------------------------------------------------
+7. ARCHIVO WAV ESTÁNDAR (canción demo / MASTER)
+--------------------------------------------------------------------------------
+La canción demo (SONG001) fue exportada/copiada a la partición MTR como un WAV
+"oficial" en:
+  offset oculto = 0x903C6C00   (absoluto = 0x0000019041 8000 )
+
+Cabecera RIFF (parsed):
+  "RIFF"  size=0x000398 ac (235,692)  "WAVE"
+  ckID "fmt " size 16 : PCM(1) channels=2 sampleRate=44100 byteRate=176400
+                       blockAlign=4 bits=16
+  ckID "smpl" size 60  (sample loop chunk: loops=1, loopStart=?, loopTotal=...)
+  ckID "data" size 235,588
+
+  Duración real: 1.3355 s. Precisión 16-bit, 2 canales, 44.1 kHz.
+
+Se extrajo como /tmp/audio/wav1.wav (235,700 bytes) y se verificó con `sox
+wav1.wav -n stat` (OK, audio válido, sin errores de parseo).
+
+Este WAV es el único archivo con firma RIFF/WAVE de TODA la región oculta
+(scan de huellas "RIFF","WAVE","fLaC","OggS","MThd","ID3","BWF","RF64" →
+solo 1 RIFF+1 WAVE). Confirma que el resto de audio se guarda en el formato RAW
+duplicado de la §6, y solo los masters/exportaciones se escriben como WAV.
+
+--------------------------------------------------------------------------------
+8. UBICACIONES CLAVE (offsets)
+--------------------------------------------------------------------------------
+  Descriptor                     Relativo MTR        Absoluto
+  -----------------------------  -----------------  -----------------
+  Superbloque MTR                0x00090000         0x1000... 0x10000... (0x1000C1400)
+  Tabla SONG (250 slots)         0x00A80000         0x1000D8000
+  Directorio MTR (activo)        0x000C0000         0x1000C... (0x10000.../0x1000C0000)
+  Directorio MTR (espejo)        0x00210000         0x10021... (0x100210000)
+  Canción demo / WAV            0x903C6C00         0x190418000
+  audio pista (dup)              0x103DE400         0x1103DE400
+  audio pista (dup)              0x103E4C00         0x1103E4C00
+
+  Sub-particiones MTR (cabecera con modelo "08EX" y byte n.º de partición):
+    MTR#1: 0x2005E2A00   (byte 0x01)
+    MTR#2: 0x400B1D400   (byte 0x02)
+    MTR#3: 0x601057E00   (byte 0x03)
+
+  (Estas tres posiciones están separadas ~8.2 GiB y se corresponden con las
+   "particiones MTR" hasta 3 que el DP-008EX puede crear en tarjetas >8 GB.)
+
+--------------------------------------------------------------------------------
+9. HERRAMIENTAS / SCRIPTS DE ANÁLISIS
+--------------------------------------------------------------------------------
+Se generaron (bajo /tmp, fuera del repo):
+  - scan_hidden.py  : búsqueda de huellas de formatos (RIFF/WAVE/...) en la
+                      región MTR completa.
+  - scan_super.py   : localización del superbloque (patrón de 12 bytes).
+  - scan_audio2.py  : detección de zonas de datos >=64KB (unidades).
+  - map.py          : mapa de runs FF/00/Data de toda la región MTR.
+  - /tmp/audio/     : wav1.wav (WAV demo extraído), frag1.wav (de-dup de una
+                      pista), run1.bin, frag1.raw.
+
+--------------------------------------------------------------------------------
+10. CONLUSIONES / NOTAS
+--------------------------------------------------------------------------------
+1. La partición oculta usa un sistema de archivos propietario de TASCAM,
+   internamente llamado "AVFS/TAVFS2.0" (visible en el OEM del boot FAT32 y en
+   los nombres de archivo fijos MTR_FILE/MIS_FILE/CONT/TNOC).
+2. El audio de las pistas NO está comprimido: es PCM 16-bit LE @44.1 kHz con
+   cada muestra duplicada (L==R / mono). Es directamente recuperable por
+   de-dup sin pérdida.
+3. La tabla de canciones (250 slots) y los directorios MTR están duplicados
+   (espejo) para tolerar fallos.
+4. Las unidades de 2 GiB contienen, en su mitad baja, toda la metadata y los
+   bloques de audio; las mitades altas están mayoritariamente en 0xFF (libres).
+5. La "canción demo" es un WAV estándar identificado y extraíble tal cual.
+
+--------------------------------------------------------------------------------
+11. DRIVER FUSE (mtrfuse) — MONTAJE DE SOLO LECTURA
+--------------------------------------------------------------------------------
+Se implementó un driver FUSE ("mtrfuse") en C, en ./mtrfuse, que monta la
+partición MTR en modo solo lectura y expone:
+
+  /info.txt            superbloque + tabla de canciones
+  /SONG###/            subdirectorios por canción "usada"
+      /metadata/       MTR_FILE, MIS_FILE, CONT, TNOC (crudos)
+      /tracks/track_N.wav   pistas de-dup a PCM mono
+  /wav/*_master.wav    RIFF/WAVE encontrados
+  /raw/audio_XX.wav    fragmentos de audio de-dup de toda la partición
+
+Características:
+  - Autodetección del base MTR desde el MBR (fin de FAT32 = 4,293,596,160).
+  - Localización del superbloque por firma y de la tabla de canciones por el
+    marcador "SONG001" (robusto a geometrías distintas).
+  - De-dup on-the-fly del audio de las pistas (muestras duplicadas -> PCM mono).
+  - 100% solo lectura (O_RDONLY).
+
+Verificación (make selftest; no requiere /dev/fuse):
+  - Superbloque y tabla de canciones parseados correctamente (nsongs=2).
+  - El de-dup del primer bloque de audio genera un WAV (PCM mono 44.1k/16bit)
+    cuyas muestras COINCIDEN exactamente con el de-dup por programación del
+    byte en disco (164/164 samples).
+  - El montaje real FUSE no pudo probarse en el entorno de compilación por
+    ausencia de /dev/fuse y de privilegios (sin sudo).
+
+Estado: análisis y driver completados. Montaje FUSE dejado pendiente de un
+entorno con /dev/fuse disponible.
+
+--------------------------------------------------------------------------------
+(FIN DE INFORME)
+
+
+================================================================================
+12. ADDENDA — data.img (fixtures: loop1/2/3 importadas)  [verificado con ground truth]
+--------------------------------------------------------------------------------
+Se provisionó una segunda imagen "data.img" a partir de la misma SD recién
+formateada (clean.img) con TRES canciones creadas e importando un sample mono
+cada una (ver todo.txt):
+    * SONG001: loop1.wav  -> PISTA 1
+    * SONG002: loop2.wav  -> PISTA 3
+    * SONG003: loop3.wav  -> PISTA 7
+Esto aporta la referencia exacta ("oráculo") que faltaba en el análisis
+original, deducido "a ciegas". Resultados confirmados bit a bit:
+
+Geometría de data.img (MBR + FAT idénticos a sdb.img):
+  base MTR = 4,293,596,160   (fin de la FAT32 = (63 + 8,385,867)·512)
+  tamaño MTR = 26,974,940,160
+  tabla de canciones (SONG) con nsongs = 3: SONG001, SONG002, SONG003 usadas
+  (SONG004+ vacías). Marcador de localización rel 0x228030.
+
+Almacenamiento real de un sample importado (NUEVO y determinante):
+  Los loops NO se guardan en la forma L==R duplicada que se dedujo del estado
+  demo (todo.txt + lectura de la canción maestra). Un sample MONO importado se
+  graba como flujo PCM 16-bit LE de UN canal, CONTIGUO y SIN duplicar, byte por
+  byte idéntico al chunk "data" del WAV mono original.
+
+Bloques de canción (cada SONG = bloque propio en la región baja de la MTR):
+  SONG        dirblock     media (dir+0x22000)   archivos (contiene)
+   SONG001      0x240000      0x262000           MTR_FILE/MIS_FILE/CONT/TNOC...
+   SONG002      0x3f0000      0x412000
+   SONG003      0x5e8000      0x60a000
+  Los tres directorios tienen IDÉNTICO diseño de prefijo (135,936 B de
+  directorio/índices + separador) — el bloque de cada canción es uniforme.
+
+Posiciones VERIFICADAS del PCM importado en cada canción
+  (coincidencia byte-a-byte = 0 discrepancias contra loopN.wav local):
+   SONG        rel-PCM inicio   longitud   offrel dentro de media   track (todo.txt)
+   SONG001      0x0390000      376,392 B     0x12e000                1
+   SONG002      0x0540000      682,840 B     0x12e000                3
+   SONG003      0x0738000      349,050 B     0x12e000                7
+  Nota: las tres quedan al MISMO offrel (0x12e000) de su media. Por tanto el
+  número de pista NO se codifica por la posición del audio en el disco; la
+  asignación pista->región de audio debe leerse de los bloques CONT/TNOC del
+  directorio de la canción (tabla "track -> (inicio,longitud) de región"), que
+  aún no se ha decodificado en su totalidad.
+
+Impacto en el driver mtrfuse:
+  - El motor "scan/raw + de-dup automático" asumía que TODO el audio MTR es
+    L==R duplicado; sobre las fixtures graba/salta como silencio y si las
+    emitiera aplicaría de-dup indebidamente. Necesita un modo PCM 1-canal
+    crudo (sin de-dup) para leer los samples importados.
+  - El auto-test esperaba nsongs=2; corregido a 3 (SONG001..003) y pasa.
+
+Trabajo pendiente (decodificación abierta):
+  - Decodificar CONT/TNOC de una canción para mapear pista -> region(offset,
+    longitud) y así exponer /SONG#/tracks/track_N.wav con la pista correcta,
+    validando con el dato de todo.txt (track 1/3/7).
+
+================================================================================
+13. ADDENDA 2 — data.img regenerada: SONG003 con 3 tomas (loop3/4/5)
+--------------------------------------------------------------------------------
+data.img fue regenerada para poder decodificar la relación pista->audio, ya que
+antes cada SONG tenía una sola toma (imposible ver si el nº de pista se refleja
+en disco). Disposición nueva:
+   * SONG003: loop3 en pista 7, loop4 en pista 1, loop5 en pista 2
+   * SONG001/2 sin cambios (1 toma).
+
+Bloques de audio VERIFICADOS byte a byte (PCM 16-bit LE mono, contiguos,
+idénticos a su loopX.wav):
+   loop  -> SONG  rel-inicio   longitud
+   loop1 -> SONG001 0x390000  376392
+   loop2 -> SONG002 0x540000  682840
+   loop3 -> SONG003 0x738000  349050
+   loop4 -> SONG003 0x798000  198630
+   loop5 -> SONG003 0x7e0000  176216
+
+Conclusiones estructurales (relevantes para el driver):
+  1. Físicamente los bloques de audio NO codifican el nº de pista:
+     en SONG003, loop3(=pista7) quedó en el offset MÁS bajo y loop4(=pista1)
+     entre medio; loop5(=pista2) en el más alto. Orden físico 3,4,5 != pistas
+     7,1,2. La "pista" es metadato de la canción, no de la posición.
+  2. El directorio/red CONT de cada canción (misma plantilla en SONG1 y SONG3)
+     lista bloques físicos por "block-id base" propio de la canción (SONG1:
+     0x1b.., SONG3: 0x42..) y NO enumera pista1/2/7. La asociación pista->data
+     vive en otra estructura (probablemente MIS_FILE/config de sesión) aún no
+     decodificada.
+  3. Implicación práctica para mtrfuse: para servir /SONGxxx/tracks/track_N.wav
+     correctamente con N real (1/2/7...) hacen falta (a) mapear canción->su
+     CONT y (b) esa estructura pista->región; la mera búsqueda de bloques en la
+     partición NO es suficiente para nombrar la pista con su número real.
+
+Para "mostrar los tracks como .wav", la vía honesta actual es: recuperar, por
+canción, los bloques de audio que el disco declara (que sí corresponden
+byte-a-byte a los samples importados) y exponerlos; el nº de pista exacto
+(1/2/7) se confirma cotejando con el todo.txt hasta completar la decodificación
+de MIS_FILE.
+
+================================================================================
+14. ESPECIFICACIÓN MTR + DISEÑO DE mtrfuse  (para re-construir el driver)
+--------------------------------------------------------------------------------
+Esta sección es autosuficiente: con ella se puede re-crear `mtr_fuse.c` en C
+(mismo comportamiento) sin disponer del código previo. Es también el registro
+"de seguridad" que se pidió mantener tras una pérdida accidental del fuente.
+
+14.1 Mapa de disco validado (data.img, 31,268,536,320 bytes)
+   Partición FAT32  : LBA 63 .. 8,385,929   (OEM "TAVFS2.0", nombre "DP-008EX",
+                       DP-008EX). Fin = (63+8,385,867)*512 = 4,293,596,160.
+   Región MTR (oculta, sin entrada MBR): comienza en 4,293,596,160
+                       tamaño ~26,974,940,160 bytes (g_base).
+   Geometría FAT32: bps=512 spc=64(=32KiB) rsvd=32 fat=2*1024 root_cl=2
+                     data_off=1,097,216  ; directorios raíz BACKUP/WAVE/UTILITY.
+   Las carpetas de la FAT guardan también copias de loopN.wav en WAVE/ (esta
+   imagen las listaba como entradas de dir degeneradas; no fiar del parseo FAT).
+
+14.2 Cómo hallar superbloque y tabla de canciones (firma, sin constantes)
+   SUPERBLOQUE : bytes "01 01 00 00 00 00 00 02 00 00 28" dentro de los
+                 primeros 256 MiB de la MTR. Posición observada 0x210000.
+   TABLA SONG  : marca ASCII "SONG001" dentro de los primeros 256 MiB a offset
+                 0x228030. 250 slots consecutivos de 36 bytes.
+       por slot: [0..7]  nombre "SONG001" (8B)
+                 [16..19] dword BIG-ENDIAN -> "usada" si != 0 (data=0x00020001)
+                 [24..31] campo corto "S001"/"S002"... y paridad.
+   Con la marca se localiza la tabla real en vez de asumir offset. Asimismo se
+   recorre los 250 slots y se marca "usada" a los que tienen dword!=0. Resultado
+   sobre data.img: nsongs=3 (SONG001/SONG002/SONG003); SONG004+ vacías.
+
+14.3 Almacenamiento del audio (DOS formas, ambas 16-bit LE @44.1 kHz)
+   a) "duplicado" (master/demo, un sample en 2 canales L==R): cada muestra
+      16-bit se guarda 2 veces consecutivas [s0,s0,s1,s1,...]. Para escuchar:
+      emitir 1 muestra por par -> stream_dup len = raw/2.
+   b) "PCM mono crudo" (samples IMPORTADOS): 1 muestra 16-bit por frame,
+      flujo contiguo == chunk "data" del WAV mono original, byte a byte.
+   Detección por granulo de 4 KiB: requiere racha >=24 (dup) o un umbral largo
+   de frames no-silencio (raw) para no capturar metadata.
+
+14.4 Bloques de canción → audio (validado byte a byte vs loopN.wav)
+   Cada SONG usado tiene un bloque de canal con su metadata CONT/MIS en una
+   "dirbase"; el audio importado de la primera toma está a dirbase+0x150000 y
+   las tomas sucesivas dentro del mismo bloque. NO asumir canciones fijas: se
+   descubren por la tabla (14.2) + marcas CONT.
+
+   rel-offsets verificados en data.img (multi-toma):
+     SONG001 loop1 -> data rel 0x390000 (376392 B)  [pista 1, todo.txt]
+     SONG002 loop2 -> data rel 0x540000 (682840 B)  [pista 3]
+     SONG003 loop3 -> data rel 0x738000 (349050 B)  [pista 7]
+            loop4 -> data rel 0x798000 (198630 B)  [pista 1]
+            loop5 -> data rel 0x7e0000 (176216 B)  [pista 2]
+   El nº de pista NO queda codificado por la posición física (SONG003 cuya
+   pista 7 está en el offset más bajo y pista 1 en medio) -> es metadato de la
+   canción (CONT/MIS), aún no decodificado. Orden de bloques != nº de pista.
+
+14.5 Directorio/mapas CONT (confirmado)
+   En la zona de metadata de cada canción (p.ej. SONG003 cerca de 0x5eF000):
+   - Filas de 0x40 bytes mapeando bloques físicos; por fila dos campos dword
+     [X .. X+0x4000] con X creciendo 0x4000 (asignador).
+   - Los punteros a un dato p.ej. 0x738000 aparecen "00 73 80 00" (big-endian)
+     como hit de firma en varios puntos de la metadata, no en un nº de pista.
+   - El CONT de cada canción repite la plantilla igual independientemente de
+     cuántas tomas tenga la canción; sólo varía la base de "block-id" (SONG1:
+     0x1b..0x25; SONG3: 0x42..0x4c). No lista pista 1/2/7.
+
+14.6 Diseño funcional de mtrfuse (reconstruible)
+   Proceso en main():
+     1. parse -i/-p/-s; abrir O_RDONLY; detectar base MTR desde el MBR
+        (start+sectors)*512 ; sino usar -p.
+     2. load_super()  -> por firma.
+     3. load_song_table() -> por marca "SONG001" (250 slots, marca used).
+     4. scan_raw_audio()  -> recorre la MTR a granulos de 4 KiB contando hasta
+        MAX_RAW_SCAN=16 fragmentos "duplicados" (is_dup_audio). Afina inicio y
+        tope AUDIO_GRANULE. (PENDIENTE: detectar también el modo PCM crudo y
+        los bloques grandes contiguos por canción.)
+     5. monta FUSE con callbacks getattr/readdir/open/read:
+        · "/"             lista info.txt + SONGs usados + wav + raw
+        · "/info.txt"     base,size,nsongs, los SONGs usados con su dword
+        · "/SONGxxxx/"    metadata/ (+ MTR_FILE.bin MIS_FILE.bin CONT.bin
+                                        TNOC.bin stubs)  y tracks/ y export/
+        · "/SONGxxxx/tracks/track_N.wav" -> genera WAV desde un run (ver nota)
+        · "/wav/SONGxxx_master.wav","/raw/audio_NN.wav" -> WAV generado on-the-fly
+     SELFTEST (make selftest; compila con -DMTR_SELFTEST y da OK al parseo y
+     al de-dup del primer run): superbloque OK, nsongs=3, /raw/audio_00 emits
+     datos no vacíos.
+   Nota de sesgo consciente (a corregir): actualmente /tracks/ y /wav/ apuntan
+   de forma aproximada a g_raw_runs (duplicados). El objetivo siguiente es leer
+   el bloque real de la canción en su dirbase correspondiente y servirlo en
+   modo crudo/mono. La persistencia de este doc es exactamente para poder
+   rehacer ese cambio tras cualquier pérdida.
+
+14.7 Cómo reproducir el experimento/verificación
+   - Contenedor Linux con libfuse3-dev + gcc + make (+ opcional sox/file):
+       make all ; make selftest ; ./mtr_selftest -i data.img /tmp/x
+       (sin /dev/fuse basta con el selftest)
+   - Montaje real requiriendo /dev/fuse (contenedor --privileged o host):
+       ./mtrfuse -i data.img <mount> ; ls /mnt/mtr/SONG003/... etc.
+   - Validar un WAV servido con sox -i / sox out.wav -n stat contra loopN.wav.
+================================================================================
+(FIN INFORMES)
+
+-------------------------------------------------------------------------
+14.8 Progreso de reconstruccion (mtr_fuse.c)
+  - Restaurado y verificado tras perdida accidental: compila limpio;
+    selftest reproduce superbloque OK, nsongs=3, tabla de canciones OK y
+    de-dup OK del primer fragmento duplicado.
+  - Anadida "scan_low_raw": recorre la zona baja (rel < 0x840000) a 16 KiB,
+    detecta runs de PCM-mono-crudo (>= 1200 frames vivos) y los expone en
+    /raw como dup=0 (longitud aproximada por extension de "raja viva").
+    Sobre data.img: raw pasa de 16 a ~36 y aparecen ficheros grandes que
+    contienen los bloques de loop1..5 (presencia confirmada).
+  - PENDIENTE de exactitud (para que un /raw o un /SONG*/tracks wav == loopN
+    exacto y atribuir a cancion): recortar cada run al final tecnico del
+    bloque, valor que vive en CONT/MIS de la cancion, no en la extension
+    heuristica.
+================================================================================
+(FIN INFORMES)
+
+-------------------------------------------------------------------------
+14.9 Descubrimientos recientes (zona de SONG003) para servir pistas exactas
+  - 0x637000 (dentro del bloque CONT de la cancion): tabla de registros de
+    bloques f�sicos; cada fila ~0x100 con campos "8004 0003 ... 0x105258"
+    (0x105258 = marcador de tamano de bloque de audio) y parejas de offsets
+    [XX, XX+0x4000] recorriendo la data de la cancion (0x700000..0x?0000).
+    El bloque de loop3 (start 0x738000) tiene su fila aqui.
+  - 0x600480 (zona de metadata de SONG003): tabla ASCII "Track  1"..
+    "Track 255" (256 slots, cada nombre 16 B, incl. "Track 10","Track 32"...).
+    Es la tabla maestra de pistas del DP. El contenido de cada pista (offset y
+    longitud) estaria en registros asociados a cada "Track  N" (aun por unir).
+  - 0x600000: tambien una rata de punteros de bloques 0x00001a80.. creciente
+    por 0x8000 (misma data). Los tres loops (0x738000/0x798000/0x7e0000)
+    aparecen como referencias en un conjunto de records redundantes.
+  - Estado /raw actual: detecta los runs de PCM-mono-crudo correcto, pero la
+    longitud es heuristica y sobrepasa el fin exacto del bloque (el contenido
+    tras el loop no es silencio, sino otra data adyacente), por eso se oye
+    "basura". Para wav exacto == loopN hay que leer longitud por registro
+    (CONT/Track) y atribuir cada bloque a su cancion.
+================================================================================
+(FIN INFORMES)
+
+-------------------------------------------------------------------------
+14.11 RESOLUCIÓN COMPLETA: Arquitectura del sistema de archivos CONT y mapeo pista -> audio
+  - RESUELTO: El mapeo exacto de pistas y clusters de audio está completamente
+    descifrado y validado bit a bit (0 diferencias con los WAVs originales).
+  - Geometría de SONG y CONT:
+    * Cada canción SONGxxx tiene su directorio base en dbase (p.ej. SONG001 en 0x240000,
+      SONG002 en 0x3f0000, SONG003 en 0x5e8000).
+    * Dentro de cada canción, a dbase + 0x48000 se ubica el bloque CONT (0x18000 bytes).
+  - Tabla de Pistas (Track Table):
+    * En CONT + 0x80 se ubica un array de 8 dwords (Big-Endian) con los IDs de registro
+      de las 8 pistas:
+      trk_rec_id = CONT[0x80 + (track_num - 1) * 4]  (ej. 0x1a80, 0x1b00, ... 0x1e00).
+  - Cadena de Registros de Pista y Clip:
+    1. Registro de Pista (CONT + trk_rec_id, tipo 0x80040003):
+       * Dword 5 (offset +20): sub_id (ej. trk_rec_id + 0x40).
+    2. Subregistro de Pista (CONT + sub_id, tipo 0x80104900):
+       * Dword 5 (offset +20): número de eventos/clips en la pista. Si es 0, la pista está vacía.
+       * Dword 8 (offset +32): ev_rec_id (ID del registro de evento).
+    3. Registro de Evento (CONT + ev_rec_id, tipo 0x90010001):
+       * Dword 4 (offset +16): clip_rec_id.
+    4. Registro de Clip (CONT + clip_rec_id, tipo 0x80030001):
+       * Dword 9 (offset +36): take_rec_id (toma de audio asignada).
+       * Dword 11 (offset +44): length_in_samples (longitud en muestras de 16-bit).
+       * Audio en bytes = length_in_samples * 2 (16-bit LE mono PCM @ 44.1 kHz).
+    5. Registro de Toma (Take) (CONT + take_rec_id, tipo 0x80020007):
+       * Dword 5 (offset +20): block_map_id.
+    6. Registro de Mapa de Bloques (CONT + block_map_id):
+       * Dword 8 (offset +32): block_list_id.
+  - Tabla de Clusters de Audio (Block List):
+    * Cada bloque/cluster de la partición MTR tiene un tamaño exacto de 0x18000 bytes
+      (98,304 bytes = 49,152 muestras mono 16-bit = 0xc000 muestras).
+    * Los registros de lista de bloques tienen dos variantes:
+      - 0x9001: Lista directa de clusters. Pares de [cluster_id, sample_offset].
+      - 0x9000: Lista indirecta de clusters. Pares de [sub_block_list_id, sample_offset].
+    * Dirección física de un cluster:
+      cluster_offset_en_particion = cluster_id * 0x18000.
+  - Verificación Bit a Bit (data.img vs loops originales):
+    * SONG001 Track 1 -> Cluster 0x26..0x29: 376,392 bytes -> EXACT BIT-FOR-BIT MATCH con loop1.wav!
+    * SONG002 Track 3 -> Cluster 0x38..0x3e: 682,840 bytes -> EXACT BIT-FOR-BIT MATCH con loop2.wav!
+    * SONG003 Track 1 -> Cluster 0x51..0x53: 198,630 bytes -> EXACT BIT-FOR-BIT MATCH con loop4.wav!
+    * SONG003 Track 2 -> Cluster 0x54..0x55: 176,216 bytes -> EXACT BIT-FOR-BIT MATCH con loop5.wav!
+    * SONG003 Track 7 -> Cluster 0x4d..0x50: 349,050 bytes -> EXACT BIT-FOR-BIT MATCH con loop3.wav!
+    * Pistas sin audio: devuelven cabecera WAV de 44 bytes con 0 muestras (vacías).
+================================================================================
+(FIN INFORMES)

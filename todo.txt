@@ -1,0 +1,6 @@
+clean.img contiene una imagen de sd recien formateada, este seria el estado inicial.
+data.img contiene 3 songs llamadas SONG001 SONG002 y SONG003. 
+en SONG001 he importado el sample loop1.wav en la pista1, 
+en SONG002 he importado el sample loop2.wav en la pista 3, 
+y en SONG003 he importado el sample loop3.wav en la pista 7, loop4.wav en la pista 1 y loop5 en la pista 2
+los loop.wav existen en la carpeta local y tambien en la particion fat en la carpeta WAVE . usa esos datos para afinar el driver y mejorar los findings
