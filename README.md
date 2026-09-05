@@ -66,8 +66,8 @@ mountpoint/
 │       └── TNOC.bin
 ├── SONG002/
 │   └── ...
-├── wav/                      # RIFF/WAVE masters detected on disk
-└── raw/                      # Raw unmapped audio fragments on disk
+├── wav/                      # Reserved (empty: no heuristic WAV guessing)
+└── raw/                      # Reserved (empty: no heuristic audio guessing)
 ```
 
 ---

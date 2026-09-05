@@ -11,8 +11,9 @@ DP-008EX (estéreo/tratado como L==R) y expone:
 /SONG001/ … /SONG250/  un subdirectorio por canción "usada"
     /metadata/         bloques crudos MTR_FILE / MIS_FILE / CONT / TNOC
     /tracks/track_N.wav todos las pistas decodificadas
-/wav/                  RIFF/WAVE completos encontrados (masters)
-/raw/audio_XX.wav      fragmentos de audio detectados (PCM de-dup)
+/wav/ y /raw/          reservados y vacíos: el driver no publica WAVs deducidos
+                       heurísticamente; cada `track_N.wav` procede de un mapa
+                       CONT validado.
 ```
 
 El audio de las pistas del DP-008EX se guarda como **PCM 16-bit LE @44.1 kHz
@@ -55,6 +56,10 @@ gcc -O2 -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=31 mtr_fuse.c -lfuse3 -pthread
 # foreground (para depurar / no daemonizar):
 ./mtrfuse -i sdb.img -f /mnt/mtr
 
+# permitir que otros usuarios locales lean el montaje:
+# (requiere `user_allow_other` en /etc/fuse.conf)
+./mtrfuse -i /dev/sdb -a /mnt/mtr
+
 # desmontar cuando termine:
 fusermount3 -u /mnt/mtr
 ```
@@ -73,9 +78,7 @@ mtrfuse: base=4293596160 size=26974940160 nsongs=3 raw=16
 [SELFTEST] superbloque detectado OK (01 01 ...)
 [SELFTEST] nsongs=3 (esperado 3: SONG001,SONG002,SONG003)
 [SELFTEST] tabla de canciones OK
-[SELFTEST] /raw/audio_00: start=0x54086c1c len=124 dup=1 -> de-dup devolvió 62 bytes de data
-[SELFTEST] datos no-vacíos: 62/62
-[SELFTEST] de-dup OK (audio no vacío)
+[SELFTEST] OK: mapa fragmentado y hueco logico
 [SELFTEST] OK — lógica del driver validada
 ```
 (Ejecutado contra `data.img`, la imagen con 3 canciones de fixture — ver
@@ -96,10 +99,22 @@ El WAV decodificado puede validarse externamente con `sox`.
   borrador inicial usaban un base distinto por  `0x180000`; los correctos son
   los que usa el driver (superbloque en rel `0x210000`, tabla de canciones en
   rel `0x228030`, directorio MTR en rel `0x240000`).
-- **Búsqueda por firma**: el driver localiza el superbloque por su firma
-  `01 01 00 ... 28` y la tabla de canciones por el marcador `SONG001`, por lo
-  que es robusto a variaciones de geometría.
+- **Búsqueda por firma y estructura**: el driver localiza el superbloque por
+  su firma y la tabla de canciones por el marcador `SONG001`. Después valida
+  cada cabecera `CONT` y busca metadata al inicio de cada unidad MTR de 2 GiB;
+  por tanto no presupone que todas las canciones estén en los primeros 48 MiB.
+- **Bloques fragmentados**: usa el `sample_offset` de cada entrada CONT para
+  resolver la posición lógica de los samples. No asume que los bloques físicos
+  sean contiguos ni que estén ordenados.
+- **Dispositivos directos**: para `/dev/sdX` obtiene el tamaño con
+  `BLKGETSIZE64`; no usa el `st_size` nulo típico de un dispositivo de bloques.
+- **Sin falsos WAV**: se eliminó el escáner heurístico de audio crudo que podía
+  confundir metadata con PCM y publicar archivos corruptos.
 - **Solo lectura**: el descriptor de la imagen se abre con `O_RDONLY`. No se
   modifica ningún byte.
+- **Montaje sin root**: ejecuta el driver como tu usuario cuando éste tenga
+  permiso de lectura sobre el dispositivo. Usa `-a` sólo si otros usuarios
+  también deben acceder al montaje; FUSE requiere `user_allow_other` en
+  `/etc/fuse.conf` para aceptarlo.
 - Los nombres `MTR_FILE`, `MIS_FILE`, `CONT`, `TNOC` son los archivos internos
   del FS MTR documentados en `finds.txt`.

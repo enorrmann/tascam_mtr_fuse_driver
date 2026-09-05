@@ -1,4 +1,57 @@
 ================================================================================
+ACTUALIZACIÓN — CORRECCIONES APLICADAS AL DRIVER (2026-09)
+================================================================================
+
+El driver anterior daba resultados correctos sólo cuando la lista de clusters
+era físicamente contigua. Era una coincidencia de las fixtures: ignoraba el
+segundo dword de cada par CONT `[cluster_id, sample_offset]`.
+
+Semántica confirmada con SONG003:
+  - `sample_offset` está en muestras mono de 16 bits, no en bytes.
+  - Por ejemplo, los clusters de loop4 tienen offsets 0, 0xc000 y 0x18000;
+    corresponden a las posiciones lógicas 0, 49.152 y 98.304 muestras.
+  - El lector debe traducir `posición WAV -> muestra lógica -> cluster cuyo
+    intervalo contiene la muestra -> offset físico`. No puede usar
+    simplemente `ordinal_del_cluster * 0x18000`.
+  - Un intervalo lógico no mapeado se emite como silencio, sin desplazar los
+    clips posteriores. Se añadió un self-test con bloques físicamente no
+    contiguos y un hueco lógico.
+
+Localización de canciones:
+  - La exploración limitada a los primeros 512 bloques (48 MiB) fue retirada.
+  - Para cada unidad AVFS de 2 GiB se escanean sus primeros 64 MiB buscando el
+    nombre de una canción de la tabla. Una coincidencia sólo se acepta si tiene
+    una cabecera CONT válida (puntero de pista a record `0x80040003`). Esto
+    evita confundir la propia tabla SONG con metadata y encuentra canciones de
+    unidades posteriores.
+
+Acceso directo a tarjetas:
+  - Las imágenes regulares usan `st_size`; un dispositivo de bloques (`/dev/sdX`)
+    usa `BLKGETSIZE64`, ya que normalmente informa `st_size == 0`.
+  - La base MTR autodetectada es ahora el final más alto de las cuatro entradas
+    MBR válidas, no sólo la primera. Los límites `-p`/`-s` se validan antes de
+    leer.
+
+Integridad de la vista FUSE:
+  - Ya no se publican falsos masters ni fragmentos `/raw` inferidos desde
+    patrones de bytes: ese método confundía metadata AVFS con audio. `/wav` y
+    `/raw` quedan vacíos hasta disponer de un índice de masters verificable.
+  - Las rutas de pista aceptan únicamente el nombre exacto
+    `track_[1-8].wav`; sufijos como `track_1.wav.bak` ya no se exponen como
+    audio.
+  - Las cabeceras WAV se escriben explícitamente little-endian, sin casts no
+    alineados dependientes de la arquitectura.
+
+Validación ejecutada sobre data.img:
+  SONG001/pista1 == loop1.wav        376.392 bytes PCM
+  SONG002/pista3 == loop2.wav        682.840 bytes PCM
+  SONG003/pista1 == loop4.wav        198.630 bytes PCM
+  SONG003/pista2 == loop5.wav        176.216 bytes PCM
+  SONG003/pista7 == loop3.wav        349.050 bytes PCM
+Todas las comparaciones son byte a byte sobre el chunk PCM, más el self-test
+de mapa fragmentado/hueco lógico.
+
+================================================================================
 REVERSE ENGINEERING — sdb.img (TASCAM DP-008EX, 31.2 GB)
 Partición FAT32 + partición oculta propietaria "MTR" (con audio)
 ================================================================================

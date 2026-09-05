@@ -12,8 +12,7 @@
  *       /metadata/           MTR_FILE.bin / MIS_FILE.bin / CONT.bin / TNOC.bin
  *       /tracks/track_N.wav  tracks 1..8 (exact bit-for-bit PCM from cluster map)
  *       /export/track_N.wav  mirror / alias for export
- *   /wav/                    RIFF/WAVE masters found
- *   /raw/audio_XX.wav        audio blocks located verbatim on disk
+ *   /wav/ and /raw/          reserved; deliberately empty (no guessed audio)
  *
  * Build:
  *   make             -> ./mtrfuse
@@ -36,7 +35,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <linux/fs.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Format geometry (offsets are relative to the start of the MTR region). */
@@ -51,9 +55,13 @@
 #define MTR_BLOCK_SAMPLES    0xc000U     /* 49152 samples per cluster        */
 #define MAX_TRACK_CLUSTERS   2048U
 
-#define AUDIO_GRANULE        4096ULL
-#define MAX_RAW_SCAN         64U        /* dup+raw runs tracked for /raw    */
-#define DUP_SCAN_HARD        16U        /* cap for the dup-only scans       */
+/* Metadata is stored near the beginning of each 2 GiB AVFS unit.  Looking
+ * there avoids a full, multi-gigabyte linear scan at mount time while still
+ * covering all units on cards formatted by the recorder. */
+#define MTR_UNIT_SIZE         0x80000000ULL
+#define MTR_METADATA_SCAN     (64ULL * 1024ULL * 1024ULL)
+#define SONG_SCAN_BUFFER      (1024U * 1024U)
+#define MAX_RAW_SCAN           64U       /* legacy /raw namespace capacity */
 
 #define WAV_HDR_SIZE         44U
 
@@ -77,6 +85,7 @@ typedef struct {
     char        song_name[9];
     uint32_t    dword_data;         /* BE; used when != 0               */
     uint8_t     used;
+    uint8_t     located;            /* a validated CONT header was found */
     uint64_t    song_base;          /* offset relative to MTR start     */
     mtr_track   tracks[8];          /* 0..7 for tracks 1..8             */
 } song_entry;
@@ -109,6 +118,10 @@ static ssize_t read_mtr(uint64_t off, void *buf, size_t len)
         return 0;
     if (len > g.size - off)
         len = (size_t)(g.size - off);
+    if (g.base > UINT64_MAX - off || g.base + off > (uint64_t)INT64_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     return pread(g.fd, buf, len, (off_t)(g.base + off));
 }
 
@@ -123,6 +136,20 @@ static uint16_t rd_be16(const unsigned char *p)
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+static void wr_le16(unsigned char *p, uint16_t v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+}
+
+static void wr_le32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
 /* ------------------------------------------------------------------ */
 /* WAV header generator                                               */
 static void wav_header(unsigned char h[WAV_HDR_SIZE], uint32_t data_bytes,
@@ -131,18 +158,18 @@ static void wav_header(unsigned char h[WAV_HDR_SIZE], uint32_t data_bytes,
     uint32_t byte_rate = 44100u * (uint32_t)((channels == 1) ? 2 : 4);
     uint16_t block_align = (uint16_t)((channels == 1) ? 2 : 4);
     memcpy(h + 0,  "RIFF", 4);
-    *(uint32_t *)(h + 4)  = 36u + data_bytes;
+    wr_le32(h + 4, 36u + data_bytes);
     memcpy(h + 8,  "WAVE", 4);
     memcpy(h + 12, "fmt ", 4);
-    *(uint32_t *)(h + 16) = 16u;
-    *(uint16_t *)(h + 20) = 1u;
-    *(uint16_t *)(h + 22) = (uint16_t)channels;
-    *(uint32_t *)(h + 24) = 44100u;
-    *(uint32_t *)(h + 28) = byte_rate;
-    *(uint16_t *)(h + 32) = block_align;
-    *(uint16_t *)(h + 34) = 16u;
+    wr_le32(h + 16, 16u);
+    wr_le16(h + 20, 1u);
+    wr_le16(h + 22, (uint16_t)channels);
+    wr_le32(h + 24, 44100u);
+    wr_le32(h + 28, byte_rate);
+    wr_le16(h + 32, block_align);
+    wr_le16(h + 34, 16u);
     memcpy(h + 36, "data", 4);
-    *(uint32_t *)(h + 40) = data_bytes;
+    wr_le32(h + 40, data_bytes);
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,10 +196,36 @@ static void load_super(void)
     }
 }
 
+/* SONG names also appear in every song's CONT header.  A table is
+ * distinguished by its fixed 36-byte slots and the short Snnn identifiers at
+ * +28, which increase one per slot even on recorders that use custom song
+ * names or start numbering at SONG000. */
+static int valid_song_table(uint64_t table_off)
+{
+    unsigned char slots[8 * SONG_SLOT_SIZE];
+    unsigned int first = 0;
+
+    if (table_off > g.size || sizeof(slots) > g.size - table_off ||
+        read_mtr(table_off, slots, sizeof(slots)) != (ssize_t)sizeof(slots))
+        return 0;
+    for (int i = 0; i < 8; i++) {
+        const unsigned char *short_name = slots + i * SONG_SLOT_SIZE + 28;
+        if (short_name[0] != 'S' || short_name[1] < '0' || short_name[1] > '9' ||
+            short_name[2] < '0' || short_name[2] > '9' ||
+            short_name[3] < '0' || short_name[3] > '9')
+            return 0;
+        unsigned int n = (unsigned int)(short_name[1] - '0') * 100U +
+                         (unsigned int)(short_name[2] - '0') * 10U +
+                         (unsigned int)(short_name[3] - '0');
+        if (i == 0) first = n;
+        else if (n != first + (unsigned int)i) return 0;
+    }
+    return 1;
+}
+
 static void load_song_table(void)
 {
     unsigned char buf[64 * 1024];
-    static const char marker[] = "SONG001";
     uint64_t off;
     uint64_t lim = g.size < 0x10000000ULL ? g.size : 0x10000000ULL;
     uint64_t table_off = 0;
@@ -182,11 +235,19 @@ static void load_song_table(void)
 
     for (off = 0; off + sizeof(buf) <= lim; off += sizeof(buf)) {
         ssize_t n = read_mtr(off, buf, sizeof(buf));
-        if (n < (ssize_t)sizeof(marker))
+        if (n < 4)
             break;
-        for (size_t i = 0; i + sizeof(marker) <= (size_t)n; i++) {
-            if (memcmp(buf + i, marker, sizeof(marker) - 1) == 0) {
-                table_off = off + i;
+        for (size_t i = 0; i + 4 <= (size_t)n; i++) {
+            uint64_t candidate = 0;
+            if (memcmp(buf + i, "SONG", 4) == 0) {
+                candidate = off + i;
+            } else if (i >= 28 && buf[i] == 'S' &&
+                       ((memcmp(buf + i, "S000", 4) == 0) ||
+                        (memcmp(buf + i, "S001", 4) == 0))) {
+                candidate = off + i - 28;
+            }
+            if (candidate && valid_song_table(candidate)) {
+                table_off = candidate;
                 break;
             }
         }
@@ -195,7 +256,9 @@ static void load_song_table(void)
     }
     if (!table_off) {
         table_off = SONG_TABLE_OFF;
-        if (table_off + SONG_TABLE_COUNT * SONG_SLOT_SIZE > g.size)
+        if (table_off > g.size ||
+            SONG_TABLE_COUNT * SONG_SLOT_SIZE > g.size - table_off ||
+            !valid_song_table(table_off))
             return;
     }
 
@@ -227,10 +290,11 @@ static void load_song_table(void)
 
 /* ------------------------------------------------------------------ */
 /* Track & Cluster parsing from CONT block                             */
-static void parse_track_clusters(const unsigned char *cont, size_t cont_len,
-                                 uint32_t rec_id, mtr_track *trk)
+static void parse_track_clusters_impl(const unsigned char *cont, size_t cont_len,
+                                      uint32_t rec_id, mtr_track *trk,
+                                      unsigned depth)
 {
-    if (rec_id + 64 > cont_len)
+    if (depth > 32 || rec_id > cont_len || 64 > cont_len - rec_id)
         return;
     const unsigned char *rec = cont + rec_id;
     uint16_t magic = rd_be16(rec + 4);
@@ -258,10 +322,27 @@ static void parse_track_clusters(const unsigned char *cont, size_t cont_len,
                 break;
             uint32_t sub_rec_id = rd_be32(rec + pos);
             if (sub_rec_id != 0xffffffff) {
-                parse_track_clusters(cont, cont_len, sub_rec_id, trk);
+                parse_track_clusters_impl(cont, cont_len, sub_rec_id, trk,
+                                         depth + 1);
             }
         }
     }
+}
+
+static void parse_track_clusters(const unsigned char *cont, size_t cont_len,
+                                 uint32_t rec_id, mtr_track *trk)
+{
+    parse_track_clusters_impl(cont, cont_len, rec_id, trk, 0);
+}
+
+static int compare_track_cluster(const void *a, const void *b)
+{
+    const track_cluster *ca = a, *cb = b;
+    if (ca->sample_offset < cb->sample_offset) return -1;
+    if (ca->sample_offset > cb->sample_offset) return 1;
+    if (ca->cluster_idx < cb->cluster_idx) return -1;
+    if (ca->cluster_idx > cb->cluster_idx) return 1;
+    return 0;
 }
 
 static void load_song_tracks(song_entry *song)
@@ -322,49 +403,138 @@ static void load_song_tracks(song_entry *song)
         trk->wav_bytes = (uint64_t)WAV_HDR_SIZE + trk->pcm_bytes;
 
         parse_track_clusters(cont, sizeof(cont), block_list_id, trk);
-    }
-}
+        if (trk->num_clusters > 1)
+            qsort(trk->clusters, trk->num_clusters, sizeof(trk->clusters[0]),
+                  compare_track_cluster);
 
-/* Locate the base of each active song and parse its tracks */
-static void load_songs_and_tracks(void)
-{
-    /* Scan first 512 blocks for CONT signatures (offset 0x40 has "SONGxxx" at +16) */
-    uint32_t max_blocks = 512;
-    if ((uint64_t)max_blocks * MTR_BLOCK_SIZE > g.size)
-        max_blocks = (uint32_t)(g.size / MTR_BLOCK_SIZE);
-
-    unsigned char buf[64];
-    for (uint32_t b = 0; b < max_blocks; b++) {
-        uint64_t blk_off = (uint64_t)b * MTR_BLOCK_SIZE;
-        if (read_mtr(blk_off + 0x40, buf, sizeof(buf)) != (ssize_t)sizeof(buf))
-            break;
-
-        if (memcmp(buf + 16, "SONG", 4) == 0) {
-            char name[9];
-            memcpy(name, buf + 16, 8);
-            name[8] = 0;
-            for (int k = 7; k >= 0; k--) {
-                if (name[k] == ' ' || name[k] == '\0')
-                    name[k] = 0;
-                else
-                    break;
-            }
-
-            for (int i = 0; i < (int)SONG_TABLE_COUNT; i++) {
-                if (!g.songs[i].used)
-                    continue;
-                if (strcmp(g.songs[i].song_name, name) == 0) {
-                    if (blk_off >= 0x48000ULL)
-                        g.songs[i].song_base = blk_off - 0x48000ULL;
-                    load_song_tracks(&g.songs[i]);
-                    break;
-                }
-            }
+        /* A usable map must begin at sample zero.  Do not claim a non-empty
+         * track when its metadata is incomplete: returning fabricated silence
+         * is worse than exposing an empty, valid WAV. */
+        if (trk->num_clusters == 0 || trk->clusters[0].sample_offset != 0) {
+            memset(trk, 0, sizeof(*trk));
+            trk->wav_bytes = WAV_HDR_SIZE;
         }
     }
 }
 
+/* Locate the base of each active song and parse its tracks */
+static int song_index_by_name(const char *name)
+{
+    for (int i = 0; i < (int)SONG_TABLE_COUNT; i++) {
+        if (g.songs[i].used && strcmp(g.songs[i].song_name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* A SONG name also occurs in the song table, so accepting a string match is
+ * unsafe.  A real CONT block has a track-record pointer at +0x80 which points
+ * to an 0x80040003 record inside the same 96 KiB block. */
+static int valid_cont_header(uint64_t cont_off)
+{
+    unsigned char header[0x100];
+    uint32_t rec;
+
+    if (cont_off > g.size || sizeof(header) > g.size - cont_off)
+        return 0;
+    if (read_mtr(cont_off, header, sizeof(header)) != (ssize_t)sizeof(header))
+        return 0;
+    if (rd_be32(header + 0x44) != 0x80000000U)
+        return 0;
+    rec = rd_be32(header + 0x80);
+    if (rec > MTR_BLOCK_SIZE - 8)
+        return 0;
+    if (read_mtr(cont_off + rec, header, 8) != 8)
+        return 0;
+    return rd_be32(header + 4) == 0x80040003U;
+}
+
+static void register_song_cont(int idx, uint64_t cont_off)
+{
+    song_entry *song = &g.songs[idx];
+
+    if (song->located || cont_off < 0x48000ULL || !valid_cont_header(cont_off))
+        return;
+    song->song_base = cont_off - 0x48000ULL;
+    song->located = 1;
+    load_song_tracks(song);
+}
+
+/* Look for validated CONT headers.  AVFS puts song metadata in the first part
+ * of every 2 GiB allocation unit; this covers cards with songs outside the
+ * first unit, unlike the old 512-block scan. */
+static void scan_song_headers_region(uint64_t start, uint64_t end)
+{
+    unsigned char *buf = malloc(SONG_SCAN_BUFFER + 7U);
+    uint64_t off = start;
+    size_t carry = 0;
+
+    if (!buf)
+        return;
+    while (off < end) {
+        size_t want = (size_t)(end - off);
+        if (want > SONG_SCAN_BUFFER)
+            want = SONG_SCAN_BUFFER;
+        ssize_t n = read_mtr(off, buf + carry, want);
+        if (n <= 0)
+            break;
+        size_t have = carry + (size_t)n;
+        for (size_t p = 0; p + 8 <= have; p++) {
+            if (memcmp(buf + p, "SONG", 4) != 0)
+                continue;
+            char name[9];
+            memcpy(name, buf + p, 8);
+            name[8] = '\0';
+            for (int k = 7; k >= 0; k--) {
+                if (name[k] == ' ' || name[k] == '\0') name[k] = '\0';
+                else break;
+            }
+            int idx = song_index_by_name(name);
+            /* In a CONT header the name begins at offset 0x50. */
+            uint64_t candidate = off + p - carry;
+            if (idx >= 0 && candidate >= 0x50ULL)
+                register_song_cont(idx, candidate - 0x50ULL);
+        }
+        if ((size_t)n < want)
+            break;
+        carry = have < 7 ? have : 7;
+        if (carry)
+            memmove(buf, buf + have - carry, carry);
+        off += (uint64_t)n;
+    }
+    free(buf);
+}
+
+static void load_songs_and_tracks(void)
+{
+    for (uint64_t unit = 0; unit < g.size; unit += MTR_UNIT_SIZE) {
+        uint64_t end = unit + MTR_METADATA_SCAN;
+        if (end < unit || end > g.size)
+            end = g.size;
+        scan_song_headers_region(unit, end);
+        int missing = 0;
+        for (int i = 0; i < (int)SONG_TABLE_COUNT; i++)
+            if (g.songs[i].used && !g.songs[i].located) missing++;
+        if (missing == 0)
+            break;
+    }
+}
+
 /* Read PCM audio or WAV header from track with O(1) cluster resolution */
+static const track_cluster *cluster_for_sample(const mtr_track *trk,
+                                               uint64_t sample,
+                                               uint64_t *samples_left)
+{
+    for (uint32_t i = 0; i < trk->num_clusters; i++) {
+        uint64_t first = trk->clusters[i].sample_offset;
+        if (sample < first || sample - first >= MTR_BLOCK_SAMPLES)
+            continue;
+        *samples_left = MTR_BLOCK_SAMPLES - (sample - first);
+        return &trk->clusters[i];
+    }
+    return NULL;
+}
+
 static size_t read_track_wav(const mtr_track *trk, char *buf, size_t size, off_t offset)
 {
     if ((uint64_t)offset >= trk->wav_bytes || size == 0)
@@ -386,26 +556,41 @@ static size_t read_track_wav(const mtr_track *trk, char *buf, size_t size, off_t
     /* 2. PCM Data */
     uint64_t pcm_pos = (off_u >= (uint64_t)WAV_HDR_SIZE) ? (off_u - (uint64_t)WAV_HDR_SIZE) : 0;
     while (written < size && pcm_pos < trk->pcm_bytes) {
-        uint64_t cluster_ord = pcm_pos / MTR_BLOCK_SIZE;
-        if (cluster_ord >= (uint64_t)trk->num_clusters) {
-            size_t pad = size - written;
-            if (pcm_pos + pad > trk->pcm_bytes)
-                pad = (size_t)(trk->pcm_bytes - pcm_pos);
-            memset(buf + written, 0, pad);
-            written += pad;
-            pcm_pos += pad;
-            break;
+        uint64_t sample = pcm_pos / 2;
+        uint64_t available_samples = 0;
+        const track_cluster *cluster = cluster_for_sample(trk, sample,
+                                                           &available_samples);
+        if (!cluster) {
+            /* An intentional timeline gap is silence.  Stop the gap at the
+             * next mapped cluster so a later clip remains readable. */
+            uint64_t next = trk->pcm_bytes / 2;
+            for (uint32_t i = 0; i < trk->num_clusters; i++) {
+                if (trk->clusters[i].sample_offset > sample &&
+                    trk->clusters[i].sample_offset < next)
+                    next = trk->clusters[i].sample_offset;
+            }
+            uint64_t gap = (next - sample) * 2;
+            if (gap > trk->pcm_bytes - pcm_pos) gap = trk->pcm_bytes - pcm_pos;
+            if (gap > size - written) gap = size - written;
+            memset(buf + written, 0, (size_t)gap);
+            written += (size_t)gap;
+            pcm_pos += gap;
+            continue;
         }
 
-        uint64_t in_cluster = pcm_pos % MTR_BLOCK_SIZE;
-        size_t chunk = (size_t)(MTR_BLOCK_SIZE - in_cluster);
+        uint64_t in_cluster = (sample - cluster->sample_offset) * 2 +
+                              (pcm_pos & 1U);
+        size_t chunk = (size_t)(available_samples * 2 - (pcm_pos & 1U));
         if (chunk > size - written)
             chunk = size - written;
         if (pcm_pos + chunk > trk->pcm_bytes)
             chunk = (size_t)(trk->pcm_bytes - pcm_pos);
 
-        uint32_t c_idx = trk->clusters[cluster_ord].cluster_idx;
+        uint32_t c_idx = cluster->cluster_idx;
         uint64_t disk_off = (uint64_t)c_idx * MTR_BLOCK_SIZE + in_cluster;
+
+        if (disk_off >= g.size || chunk > g.size - disk_off)
+            break;
 
         ssize_t r = read_mtr(disk_off, buf + written, chunk);
         if (r <= 0) break;
@@ -414,65 +599,6 @@ static size_t read_track_wav(const mtr_track *trk, char *buf, size_t size, off_t
     }
 
     return written;
-}
-
-/* ------------------------------------------------------------------ */
-/* Raw/Dup fallback scanner                                            */
-static int is_dup_audio(const unsigned char *p, size_t len)
-{
-    size_t i, n, run = 0, best = 0;
-    n = (len / 4) * 4;
-    for (i = 0; i + 4 <= n; i += 4) {
-        int16_t a = (int16_t)(p[i] | (p[i + 1] << 8));
-        int16_t b = (int16_t)(p[i + 2] | (p[i + 3] << 8));
-        if (a == b && a != 0 && a != -1) {
-            run++;
-            if (run > best) best = run;
-        } else {
-            run = 0;
-        }
-    }
-    return best >= 24;
-}
-
-static void scan_raw_audio(void)
-{
-    unsigned char buf[AUDIO_GRANULE];
-    uint64_t off = 0;
-    int count = 0;
-    while (off < g.size && count < (int)DUP_SCAN_HARD) {
-        ssize_t r = read_mtr(off, buf, sizeof(buf));
-        if (r <= 0)
-            break;
-        if (is_dup_audio(buf, (size_t)r)) {
-            size_t n = (size_t)r / 4;
-            size_t best = 0, bs = 0, run = 0, cur = 0;
-            for (size_t i = 0; i < n; i++) {
-                int16_t a = (int16_t)(buf[i*4] | (buf[i*4+1] << 8));
-                int16_t b = (int16_t)(buf[i*4+2] | (buf[i*4+3] << 8));
-                if (a == b && a != 0 && a != -1) {
-                    if (run == 0) cur = i;
-                    run++;
-                    if (run > best) { best = run; bs = cur; }
-                } else {
-                    run = 0;
-                }
-            }
-            if (best >= 24) {
-                g_raw_runs[count].start = off + bs * 4;
-                uint64_t from = off + bs * 4;
-                uint64_t maxlen = g.size - from;
-                uint64_t l = (uint64_t)(best * 4);
-                if (l > maxlen) l = maxlen;
-                if (l > AUDIO_GRANULE) l = AUDIO_GRANULE;
-                g_raw_runs[count].len = l;
-                g_raw_runs[count].dup = 1;
-                count++;
-            }
-        }
-        off += AUDIO_GRANULE;
-    }
-    g_raw_count = count;
 }
 
 static size_t fill_audio_wav(char *buf, size_t size, off_t offset,
@@ -547,6 +673,16 @@ static song_entry *song_from_path(const char *path, const char **subpath)
     return s;
 }
 
+static int track_number_from_filename(const char *fn)
+{
+    /* Accept exactly track_1.wav through track_8.wav.  atoi() previously
+     * accepted paths such as track_1.wav.bak as regular audio files. */
+    if (strncmp(fn, "track_", 6) != 0 || fn[6] < '1' || fn[6] > '8' ||
+        strcmp(fn + 7, ".wav") != 0)
+        return -1;
+    return fn[6] - '0';
+}
+
 /* ------------------------------------------------------------------ */
 /* FUSE: getattr                                                      */
 static int mtr_getattr(const char *path, struct stat *st,
@@ -592,13 +728,11 @@ static int mtr_getattr(const char *path, struct stat *st,
         }
         if (strncmp(subpath, "/tracks/", 8) == 0 || strncmp(subpath, "/export/", 8) == 0) {
             const char *fn = subpath + 8;
-            if (strncmp(fn, "track_", 6) == 0) {
-                int tn = atoi(fn + 6);
-                if (tn >= 1 && tn <= 8) {
-                    st->st_mode = S_IFREG | 0444; st->st_nlink = 1;
-                    st->st_size = (off_t)s->tracks[tn - 1].wav_bytes;
-                    return 0;
-                }
+            int tn = track_number_from_filename(fn);
+            if (tn >= 1) {
+                st->st_mode = S_IFREG | 0444; st->st_nlink = 1;
+                st->st_size = (off_t)s->tracks[tn - 1].wav_bytes;
+                return 0;
             }
             return -ENOENT;
         }
@@ -607,12 +741,6 @@ static int mtr_getattr(const char *path, struct stat *st,
 
     if (strcmp(path, "/wav") == 0 || strcmp(path, "/raw") == 0) {
         st->st_mode = S_IFDIR | 0555; st->st_nlink = 2;
-        return 0;
-    }
-    if (strncmp(path, "/wav/SONG", 9) == 0) {
-        st->st_mode = S_IFREG | 0444; st->st_nlink = 1;
-        if (g_raw_count) st->st_size = (off_t)(WAV_HDR_SIZE + g_raw_runs[0].len / 2);
-        else             st->st_size = WAV_HDR_SIZE;
         return 0;
     }
     if (strncmp(path, "/raw/audio_", 11) == 0) {
@@ -683,12 +811,6 @@ static int mtr_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     if (strcmp(path, "/wav") == 0) {
         filler(buf, ".", NULL, 0, 0);
         filler(buf, "..", NULL, 0, 0);
-        for (int i = 0; i < (int)SONG_TABLE_COUNT; i++) {
-            if (!g.songs[i].used) continue;
-            char f[64];
-            snprintf(f, sizeof(f), "%s_master.wav", g.songs[i].song_name);
-            filler(buf, f, NULL, 0, 0);
-        }
         return 0;
     }
     if (strcmp(path, "/raw") == 0) {
@@ -784,12 +906,9 @@ static int mtr_read(const char *path, char *buf, size_t size, off_t offset,
         /* 2. Track audio files */
         if (strncmp(subpath, "/tracks/", 8) == 0 || strncmp(subpath, "/export/", 8) == 0) {
             const char *fn = subpath + 8;
-            if (strncmp(fn, "track_", 6) == 0) {
-                int tn = atoi(fn + 6);
-                if (tn >= 1 && tn <= 8) {
-                    return (int)read_track_wav(&s->tracks[tn - 1], buf, size, offset);
-                }
-            }
+            int tn = track_number_from_filename(fn);
+            if (tn >= 1)
+                return (int)read_track_wav(&s->tracks[tn - 1], buf, size, offset);
             return -ENOENT;
         }
     }
@@ -816,6 +935,7 @@ static void usage(const char *prog)
         "             (default: autodeteccion tras FAT32 en el MBR)\n"
         "  -s SIZE    tamano en bytes de la particion MTR\n"
         "             (default: hasta el final del archivo)\n"
+        "  -a         permitir acceso al montaje a otros usuarios (allow_other)\n"
         "  -f         foreground (por defecto se daemoniza)\n", prog);
 }
 
@@ -828,11 +948,53 @@ static int parse_u64(const char *s, uint64_t *out)
     return 0;
 }
 
+static int image_size_bytes(int fd, const struct stat *st, uint64_t *size)
+{
+    if (S_ISREG(st->st_mode)) {
+        *size = (uint64_t)st->st_size;
+        return *size != 0 ? 0 : -1;
+    }
+#ifdef BLKGETSIZE64
+    if (S_ISBLK(st->st_mode)) {
+        unsigned long long bytes = 0;
+        if (ioctl(fd, BLKGETSIZE64, &bytes) == 0 && bytes != 0) {
+            *size = (uint64_t)bytes;
+            return 0;
+        }
+    }
+#endif
+    return -1;
+}
+
+static int detect_mtr_base(int fd, uint64_t image_size, uint64_t *base)
+{
+    unsigned char mbr[512];
+    uint64_t last_end = 0;
+
+    if (pread(fd, mbr, sizeof(mbr), 0) != (ssize_t)sizeof(mbr) ||
+        mbr[510] != 0x55 || mbr[511] != 0xaa)
+        return -1;
+    for (int i = 0; i < 4; i++) {
+        const unsigned char *entry = mbr + 446 + i * 16;
+        uint32_t start = (uint32_t)entry[8] | ((uint32_t)entry[9] << 8) |
+                         ((uint32_t)entry[10] << 16) | ((uint32_t)entry[11] << 24);
+        uint32_t sectors = (uint32_t)entry[12] | ((uint32_t)entry[13] << 8) |
+                           ((uint32_t)entry[14] << 16) | ((uint32_t)entry[15] << 24);
+        uint64_t end = ((uint64_t)start + sectors) * 512ULL;
+        if (entry[4] != 0 && sectors != 0 && end <= image_size && end > last_end)
+            last_end = end;
+    }
+    if (last_end == 0 || last_end >= image_size)
+        return -1;
+    *base = last_end;
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     const char *image = NULL, *mountpoint = NULL;
     uint64_t p_off = 0, p_size = 0;
-    int i;
+    int i, allow_other = 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-i") && i + 1 < argc) image = argv[++i];
@@ -840,7 +1002,8 @@ int main(int argc, char *argv[])
             if (parse_u64(argv[++i], &p_off)) { fprintf(stderr, "offset invalido\n"); return 2; }
         } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             if (parse_u64(argv[++i], &p_size)) { fprintf(stderr, "tamano invalido\n"); return 2; }
-        } else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
+        } else if (!strcmp(argv[i], "-a")) allow_other = 1;
+        else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] == '-') { /* fuse flags */ }
         else if (!mountpoint) mountpoint = argv[i];
     }
@@ -855,20 +1018,32 @@ int main(int argc, char *argv[])
 
     struct stat st;
     if (fstat(g.fd, &st) < 0) { perror("fstat"); return 3; }
-    uint64_t file_size = (uint64_t)st.st_size;
+    uint64_t file_size;
+    if (image_size_bytes(g.fd, &st, &file_size) != 0) {
+        fprintf(stderr, "no se pudo determinar el tamano de la imagen/dispositivo\n");
+        close(g.fd);
+        return 3;
+    }
 
     if (p_off == 0 && p_size == 0) {
-        unsigned char mbr[512];
-        if (pread(g.fd, mbr, 512, 0) == 512) {
-            uint32_t start   = (uint32_t)mbr[454] | ((uint32_t)mbr[455] << 8) |
-                               ((uint32_t)mbr[456] << 16) | ((uint32_t)mbr[457] << 24);
-            uint32_t sectors = (uint32_t)mbr[458] | ((uint32_t)mbr[459] << 8) |
-                               ((uint32_t)mbr[460] << 16) | ((uint32_t)mbr[461] << 24);
-            p_off = (uint64_t)(start + sectors) * 512ULL;
+        if (detect_mtr_base(g.fd, file_size, &p_off) != 0) {
+            fprintf(stderr, "no se pudo detectar la region MTR; use -p y -s\n");
+            close(g.fd);
+            return 2;
         }
     }
-    if (p_size == 0 || p_off + p_size > file_size)
+    if (p_off >= file_size) {
+        fprintf(stderr, "offset MTR fuera de la imagen/dispositivo\n");
+        close(g.fd);
+        return 2;
+    }
+    if (p_size == 0)
         p_size = file_size - p_off;
+    else if (p_size > file_size - p_off) {
+        fprintf(stderr, "tamano MTR fuera de la imagen/dispositivo\n");
+        close(g.fd);
+        return 2;
+    }
 
     g.base = p_off;
     g.size = p_size;
@@ -876,7 +1051,10 @@ int main(int argc, char *argv[])
     load_super();
     load_song_table();
     load_songs_and_tracks();
-    scan_raw_audio();
+    /* Raw pattern matching cannot reliably distinguish audio from AVFS
+     * metadata, so do not publish guessed WAV files.  /raw remains empty;
+     * all published track WAVs are backed by validated CONT maps. */
+    g_raw_count = 0;
 
     fprintf(stderr, "mtrfuse: base=%" PRIu64 " size=%" PRIu64 " nsongs=%d raw=%d\n",
             g.base, g.size, g.nsongs, g_raw_count);
@@ -887,13 +1065,16 @@ int main(int argc, char *argv[])
     fuse_argv[n++] = (char *)"mtrfuse";
     fuse_argv[n++] = (char *)mountpoint;
     fuse_argv[n++] = (char *)"-o";
-    fuse_argv[n++] = (char *)"ro,fsname=mtr,default_permissions";
+    fuse_argv[n++] = (char *)(allow_other
+        ? "ro,fsname=mtr,default_permissions,allow_other"
+        : "ro,fsname=mtr,default_permissions");
     for (i = 1; i < argc; i++)
         if (!strcmp(argv[i], "-f")) { fuse_argv[n++] = (char *)"-f"; break; }
     fuse_argv[n] = NULL;
 #endif
 
 #ifdef MTR_SELFTEST
+    (void)allow_other;
     {
         int failures = 0;
 
@@ -1007,7 +1188,57 @@ int main(int argc, char *argv[])
             free(wav_buf);
         }
 
-        /* 4) Validate empty track gives 44-byte empty WAV */
+        /* 4) A fragmented map must use its logical sample offsets, not the
+         * order or adjacency of physical blocks.  This is the case the old
+         * implementation corrupted on real cards. */
+        {
+            char tmp[] = "/tmp/mtrfuse-map-XXXXXX";
+            int mapfd = mkstemp(tmp);
+            int saved_fd = g.fd;
+            uint64_t saved_base = g.base, saved_size = g.size;
+            mtr_track mapped;
+            unsigned char actual[6], expected[] = { 0x11, 0x22, 0, 0, 0x33, 0x44 };
+            unsigned char first[] = { 0x11, 0x22 }, second[] = { 0x33, 0x44 };
+            uint64_t last_sample = MTR_BLOCK_SAMPLES - 1;
+
+            if (mapfd < 0 || ftruncate(mapfd, (off_t)(4 * MTR_BLOCK_SIZE)) != 0 ||
+                pwrite(mapfd, first, sizeof(first),
+                       (off_t)(MTR_BLOCK_SIZE + last_sample * 2)) != 2 ||
+                pwrite(mapfd, second, sizeof(second),
+                       (off_t)(3 * MTR_BLOCK_SIZE)) != 2) {
+                fprintf(stderr, "[SELFTEST] FALLO: no se pudo preparar mapa fragmentado\n");
+                failures++;
+            } else {
+                memset(&mapped, 0, sizeof(mapped));
+                mapped.active = 1;
+                mapped.length_samples = MTR_BLOCK_SAMPLES + 2;
+                mapped.pcm_bytes = (uint64_t)mapped.length_samples * 2;
+                mapped.wav_bytes = WAV_HDR_SIZE + mapped.pcm_bytes;
+                mapped.num_clusters = 2;
+                mapped.clusters[0].cluster_idx = 1;
+                mapped.clusters[0].sample_offset = 0;
+                mapped.clusters[1].cluster_idx = 3;
+                mapped.clusters[1].sample_offset = MTR_BLOCK_SAMPLES + 1;
+                g.fd = mapfd;
+                g.base = 0;
+                g.size = 4 * MTR_BLOCK_SIZE;
+                if (read_track_wav(&mapped, (char *)actual, sizeof(actual),
+                                   WAV_HDR_SIZE + (off_t)last_sample * 2) != sizeof(actual) ||
+                    memcmp(actual, expected, sizeof(expected)) != 0) {
+                    fprintf(stderr, "[SELFTEST] FALLO: mapa de clusters fragmentado\n");
+                    failures++;
+                } else {
+                    fprintf(stderr, "[SELFTEST] OK: mapa fragmentado y hueco logico\n");
+                }
+            }
+            g.fd = saved_fd;
+            g.base = saved_base;
+            g.size = saved_size;
+            if (mapfd >= 0) close(mapfd);
+            unlink(tmp);
+        }
+
+        /* 5) Validate empty track gives 44-byte empty WAV */
         song_entry *s1 = find_song_by_name("SONG001");
         if (s1 && !s1->tracks[1].active && s1->tracks[1].wav_bytes == 44) {
             char empty_wav[64];
